@@ -12,6 +12,7 @@ My implementations of llm sft.
 	+ offload
 	+ gradient checkpointing
 	+ gradient accumulation
+	+ flash-attn
 
 # Requirements
 	pip install -r requirements
