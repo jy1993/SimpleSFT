@@ -3,8 +3,8 @@ import json
 import torch.nn.functional as F
 import os
 from torch.utils.data import Dataset
-import deepspeed
-from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
+# import deepspeed
+# from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 
 def read_json(filename):
 	with open(filename, 'r', encoding='utf8') as f:
@@ -69,11 +69,17 @@ def apply_chat_template(messages):
 
 class MultiTurnSFTDataset(Dataset):
 	"""docstring for MultiTurnSFTDataset"""
-	def __init__(self, train_filename, tokenizer, model_type):
+	def __init__(self, train_filename, tokenizer, model_type, tool_result_tags=None):
 		super(MultiTurnSFTDataset, self).__init__()
 		self.data = read_json(train_filename)
 		self.tokenizer = tokenizer
 		self.model_type = model_type
+		assert self.model_type in ['instruct', 'mixed']
+		if tool_result_tags is not None:
+			self.tool_result_start_ids = self.tokenizer(tool_result_tags[0])['input_ids']
+			self.tool_result_end_ids = self.tokenizer(tool_result_tags[1])['input_ids']
+		else:
+			self.tool_result_start_ids, self.tool_result_end_ids = None, None
 
 	def __getitem__(self, index):
 		one = self.data[index]
@@ -81,6 +87,7 @@ class MultiTurnSFTDataset(Dataset):
 		tools = one.get('tools', None)
 		if self.model_type == 'instruct':
 			text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False, tools=tools)
+			text = text.replace('<think>\n\n</think>\n\n', '')
 		else:
 			new_messages = self.add_no_think_tags(messages)
 			# text = self.tokenizer.apply_chat_template(new_messages, tokenize=False, add_generation_prompt=False, tools=tools, enable_thinking=False)
@@ -114,7 +121,38 @@ class MultiTurnSFTDataset(Dataset):
 		for i, (start, end) in enumerate(zip(im_start_pos, im_end_pos)):
 			if i > 0 and i % 2 == 0:
 				labels[start[0]+start_offset:end[0]+2] = input_ids_list[start[0]+start_offset:end[0]+2]
+		for i in self.get_label_mask(labels):
+			labels[i] = -100
 		return torch.LongTensor(labels).unsqueeze(0)
+
+	def get_label_mask(self, labels):
+		if self.tool_result_start_ids is not None and self.tool_result_end_ids is not None:
+			n = len(labels)
+			start_len = len(self.tool_result_start_ids)
+			end_len = len(self.tool_result_end_ids)
+			if n < start_len + end_len:
+				return []
+			start_positions = []
+			for i in range(n - start_len + 1):
+				if labels[i:i+start_len] == self.tool_result_start_ids:
+					start_positions.append(i)
+			end_positions = []
+			for j in range(end_len - 1, n):
+				if j - end_len + 1 >= 0 and labels[j-end_len+1:j+1] == self.tool_result_end_ids:
+					end_positions.append(j)
+			intervals = []
+			for start in start_positions:
+				for end in end_positions:
+					if end >= start + start_len + end_len - 1:
+						intervals.append((start, end))
+						break
+			indexs = []
+			for se in intervals:
+				s, e = se
+				for i in range(s, e+end_len):
+					indexs.append(i)
+			return indexs
+		return []
 
 def pad_and_cat(tensor_list, padding):
 	max_len = max([tensor.shape[1] for tensor in tensor_list])
@@ -236,26 +274,48 @@ def print_gpu_memory(rank):
 	print(f"  ▸ 剩余可用: {free:.2f} GB\n")
 	torch.distributed.barrier()
 
-def _z3_params_to_fetch(param_list):
-	return [
-		p for p in param_list
-		if hasattr(p, 'ds_id') and p.ds_status == ZeroParamStatus.NOT_AVAILABLE
-	]
+# def _z3_params_to_fetch(param_list):
+# 	return [
+# 		p for p in param_list
+# 		if hasattr(p, 'ds_id') and p.ds_status == ZeroParamStatus.NOT_AVAILABLE
+# 	]
+
+# def save_zero_three_model(model, args, path):
+# 	os.makedirs(path, exist_ok=True)
+# 	WEIGHTS_NAME = "pytorch_model.bin"
+# 	output_model_file = os.path.join(path, WEIGHTS_NAME)
+# 	model_to_save = model.module if hasattr(model, 'module') else model
+# 	output_state_dict = {}
+# 	for k, v in model_to_save.named_parameters():
+# 		if hasattr(v, 'ds_id'):
+# 			with deepspeed.zero.GatheredParameters(_z3_params_to_fetch([v]),enabled=True):
+# 				v_p = v.data
+# 		else:
+# 			v_p = v
+# 		if args.global_rank == 0:
+# 			output_state_dict[k] = v_p
+# 	if args.global_rank == 0:
+# 		torch.save(output_state_dict, output_model_file)
+# 	del output_state_dict
 
 def save_zero_three_model(model, args, path):
 	os.makedirs(path, exist_ok=True)
 	WEIGHTS_NAME = "pytorch_model.bin"
 	output_model_file = os.path.join(path, WEIGHTS_NAME)
 	model_to_save = model.module if hasattr(model, 'module') else model
-	output_state_dict = {}
-	for k, v in model_to_save.named_parameters():
-		if hasattr(v, 'ds_id'):
-			with deepspeed.zero.GatheredParameters(_z3_params_to_fetch([v]),enabled=True):
-				v_p = v.data
-		else:
-			v_p = v
-		if args.global_rank == 0:
-			output_state_dict[k] = v_p
 	if args.global_rank == 0:
-		torch.save(output_state_dict, output_model_file)
-	del output_state_dict
+		params_to_gather = []
+		params_to_save = {}
+		for k, v in model_to_save.named_parameters():
+			if not hasattr(v, 'ds_id'):
+				params_to_save[k] = v.data
+		for k, v in model_to_save.named_parameters():
+			if hasattr(v, 'ds_id'):
+				params_to_gather.append(v)
+		with deepspeed.zero.GatheredParameters(params_to_gather, enabled=True, modifier_rank=0):
+			if args.global_rank == 0:
+				for k, v in model_to_save.named_parameters():
+					if hasattr(v, 'ds_id'):
+						params_to_save[k] = v.data.cpu()
+		torch.save(params_to_save, output_model_file)
+		del params_to_save

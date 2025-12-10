@@ -17,8 +17,16 @@ My implementations of llm sft.
 # Requirements
 	pip install -r requirements
 
+# Dataset format
+refer to data/retool_sft_short.txt
+
 # Train
+Note: for mixed model(with both thinking mode and no thinking mode) like Qwen3-1.7B, set MODEL_TYPE to mixed, otherwise set it to instruct.  
+
 	bash scripts/run_sft.sh
+
+## train_curves_of_qwen2.5_7B_instruct_on_retool_sft
+![train_curves_of_qwen2.5_7B_instruct_on_retool_sft](/assets/images/train_curves_of_qwen2.5_7B_instruct_on_retool_sft.png)
 
 # infer
 	bash scripts/infer.sh

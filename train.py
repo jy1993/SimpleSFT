@@ -39,6 +39,7 @@ parser.add_argument('--zero_stage', type=int, default=0)
 parser.add_argument('--gradient_checkpointing', action='store_true')
 parser.add_argument('--local_rank', type=int, default=-1)
 parser.add_argument('--model_type', type=str, choices=['instruct', 'mixed'])
+parser.add_argument('--tool_result_tags', type=str, default=None)
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
 
@@ -92,7 +93,7 @@ def train(model, tokenizer, train_loader, valid_loader, optimizer, scheduler, wr
 				save_everything(model, tokenizer, args, global_step)
 
 	# save final model
-	if args.global_rank == 0
+	if args.global_rank == 0:
 		save_everything(model, tokenizer, args, global_step)
 
 def main():
@@ -126,7 +127,7 @@ def main():
 	AdamOptimizer = DeepSpeedCPUAdam if args.offload else FusedAdam
 	optimizer = AdamOptimizer(optimizer_grouped_parameters, lr=args.lr, betas=(0.9, 0.95))
 	# train_dataset = SFTDataset(args.train_filename, tokenizer, args.model_type)
-	train_dataset = MultiTurnSFTDataset(args.train_filename, tokenizer, args.model_type)
+	train_dataset = MultiTurnSFTDataset(args.train_filename, tokenizer, args.model_type, args.tool_result_tags.split(','))
 	if args.global_rank == 0:
 		print(tokenizer.decode(train_dataset[0][0][0]))
 		print('*' * 10)
