@@ -1,4 +1,4 @@
-# SimpleRL
+# SimpleSFT
 My implementations of llm sft and dpo.
 
 # Features
