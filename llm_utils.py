@@ -154,19 +154,148 @@ class MultiTurnSFTDataset(Dataset):
 			return indexs
 		return []
 
+class DPODataset(Dataset):
+	"""docstring for DPODataset"""
+	def __init__(self, train_filename, tokenizer, model_type, tool_result_tags=None):
+		super(DPODataset, self).__init__()
+		self.data = read_json(train_filename)
+		self.tokenizer = tokenizer
+		self.model_type = model_type
+		if tool_result_tags is not None:
+			self.tool_result_start_ids = self.tokenizer(tool_result_tags[0])['input_ids']
+			self.tool_result_end_ids = self.tokenizer(tool_result_tags[1])['input_ids']
+		else:
+			self.tool_result_start_ids, self.tool_result_end_ids = None, None
+
+	def __getitem__(self, index):
+		one = self.data[index]
+		messages = one['messages']
+		chosen_messages = messages[:-2] + [{'role': 'assistant', 'content': messages[-2]['content']}]
+		rejected_messages = messages[:-2] + [{'role': 'assistant', 'content': messages[-1]['content']}]
+		tools = one.get('tools', None)
+		if self.model_type == 'instruct':
+			chosen_text = self.tokenizer.apply_chat_template(chosen_messages, tokenize=False, add_generation_prompt=False, tools=tools, enable_thinking=False)
+			chosen_text = chosen_text.replace('<think>\n\n</think>\n\n', '')
+			rejected_text = self.tokenizer.apply_chat_template(rejected_messages, tokenize=False, add_generation_prompt=False, tools=tools, enable_thinking=False)
+			rejected_text = rejected_text.replace('<think>\n\n</think>\n\n', '')
+		else:
+			# text = self.tokenizer.apply_chat_template(new_messages, tokenize=False, add_generation_prompt=False, tools=tools, enable_thinking=False)
+			chosen_text = apply_chat_template(self.add_no_think_tags(chosen_messages))
+			rejected_text = apply_chat_template(self.add_no_think_tags(rejected_messages))
+		chosen_inputs = self.tokenizer(chosen_text, add_special_tokens=False, return_tensors='pt')
+		chosen_labels = self.get_labels(chosen_inputs['input_ids'])
+		rejected_inputs = self.tokenizer(rejected_text, add_special_tokens=False, return_tensors='pt')
+		rejected_labels = self.get_labels(rejected_inputs['input_ids'])
+		return chosen_inputs['input_ids'], chosen_inputs['attention_mask'], chosen_labels, rejected_inputs['input_ids'], rejected_inputs['attention_mask'], rejected_labels
+
+	def __len__(self):
+		return len(self.data)
+
+	def add_no_think_tags(self, messages):
+		new_messages = []
+		for m in messages:
+			if m['role'] == 'assistant':
+				new_messages.append({'role': 'assistant', 'content': '<think>\n\n</think>\n\n' + m['content']})
+			else:
+				new_messages.append(m)
+		return new_messages
+
+	def get_labels(self, input_ids):
+		# only last
+		im_start_pos = (input_ids[0] == self.tokenizer.vocab['<|im_start|>']).nonzero().tolist()[-1:]
+		im_end_pos = (input_ids[0] == self.tokenizer.vocab['<|im_end|>']).nonzero().tolist()[-1:]
+		assert len(im_start_pos) == len(im_end_pos)
+		labels = [-100] * input_ids.shape[1]
+		input_ids_list = input_ids[0].tolist()
+		if self.model_type == 'mixed':
+			# 3 for <|im_start|>assistant\n
+			# 4 for <think>\n\n</think>\n\n
+			start_offset = 7
+		else:
+			start_offset = 3
+		for i, (start, end) in enumerate(zip(im_start_pos, im_end_pos)):
+			labels[start[0]+start_offset:end[0]+2] = input_ids_list[start[0]+start_offset:end[0]+2]
+		for i in self.get_label_mask(labels):
+			labels[i] = -100
+		return torch.LongTensor(labels).unsqueeze(0)
+
+	def get_label_mask(self, labels):
+		if self.tool_result_start_ids is not None and self.tool_result_end_ids is not None:
+			n = len(labels)
+			start_len = len(self.tool_result_start_ids)
+			end_len = len(self.tool_result_end_ids)
+			if n < start_len + end_len:
+				return []
+			start_positions = []
+			for i in range(n - start_len + 1):
+				if labels[i:i+start_len] == self.tool_result_start_ids:
+					start_positions.append(i)
+			end_positions = []
+			for j in range(end_len - 1, n):
+				if j - end_len + 1 >= 0 and labels[j-end_len+1:j+1] == self.tool_result_end_ids:
+					end_positions.append(j)
+			intervals = []
+			for start in start_positions:
+				for end in end_positions:
+					if end >= start + start_len + end_len - 1:
+						intervals.append((start, end))
+						break
+			indexs = []
+			for se in intervals:
+				s, e = se
+				for i in range(s, e+end_len):
+					indexs.append(i)
+			return indexs
+		return []
+
 def pad_and_cat(tensor_list, padding):
 	max_len = max([tensor.shape[1] for tensor in tensor_list])
 	return torch.cat([torch.cat([tensor, torch.ones(1, max_len - tensor.shape[1], dtype=torch.long) * padding], dim=1) for tensor in tensor_list], dim=0)
 
-def collate_for_lm(batch):
+def collate_for_sft(batch):
 	input_ids = pad_and_cat([item[0] for item in batch], 151643)
 	attention_mask = pad_and_cat([item[1] for item in batch], 0)
 	labels = pad_and_cat([item[2] for item in batch], -100)
 	return input_ids, attention_mask, labels
 
-def prepare_model_inputs(batch):
-	inputs = {'input_ids': batch[0], 'attention_mask': batch[1], 'labels': batch[2]}
+def collate_for_dpo(batch):
+	all_input_ids = pad_and_cat([item[0] for item in batch]+[item[3] for item in batch], 151643)
+	all_attention_mask = pad_and_cat([item[1] for item in batch]+[item[4] for item in batch], 0)
+	all_labels = pad_and_cat([item[2] for item in batch]+[item[5] for item in batch], -100)
+	half = all_input_ids.shape[0] // 2
+	return all_input_ids[:half], all_attention_mask[:half], all_labels[:half], all_input_ids[half:], all_attention_mask[half:], all_labels[half:]
+
+def prepare_model_inputs(batch, task_type):
+	if task_type == 'sft':
+		inputs = {'input_ids': batch[0], 'attention_mask': batch[1], 'labels': batch[2]}
+	elif task_type == 'dpo':
+		inputs = {
+			'input_ids': torch.cat([batch[0], batch[3]], dim=0),
+			'attention_mask': torch.cat([batch[1], batch[4]], dim=0),
+			'chosen_labels': batch[2],
+			'rejected_labels': batch[5]
+		}
 	return inputs
+
+def get_logps(logits, labels):
+	logits = logits[:, :-1]
+	labels = labels[:, 1:]
+	log_probs = F.log_softmax(logits, dim=-1)
+	labels_wo_neg_100 = labels.clone()
+	labels_wo_neg_100[labels_wo_neg_100==-100] = 0
+	per_token_logps = torch.gather(log_probs, dim=-1, index=labels_wo_neg_100.unsqueeze(-1)).squeeze(-1)
+	loss_mask = (labels != -100)
+	logps = (per_token_logps * loss_mask).sum(dim=-1)
+	return logps
+
+def get_dpo_loss(policy_chosen_logps, policy_rej_logps, ref_chosen_logps, ref_rej_logps, beta=0.1):
+	ratio1 = policy_chosen_logps - policy_rej_logps
+	ratio2 = ref_chosen_logps = ref_rej_logps
+	logits = beta * (ratio1 - ratio2)
+	loss = - F.logsigmoid(logits)
+	chosen_rewards = beta * (policy_chosen_logps - ref_chosen_logps)
+	rej_rewards = beta * (policy_rej_logps - ref_rej_logps)
+	return loss.mean(), chosen_rewards.mean(), rej_rewards.mean()
 
 def get_simpo_loss(args, batch, logits):
 	chosen_logits, rejected_logits = torch.split(logits, logits.shape[0] // 2, dim=0)

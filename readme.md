@@ -1,9 +1,9 @@
 # SimpleRL
-My implementations of llm sft.
+My implementations of llm sft and dpo.
 
 # Features
 + Supported models
-	+ Qwen2/Qwen2.5/Qwen3 language models
+	+ Qwen2/Qwen2.5/Qwen3 language models and vision language models
 + Supported situations
 	+ single-turn/multiturn data
 	+ agent training
